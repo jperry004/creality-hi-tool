@@ -1,0 +1,9 @@
+# backups and logs pulled from your printers (contain your configs)
+hi_backups/
+*.log
+# your own printer list
+printers.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
