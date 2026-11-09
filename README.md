@@ -18,6 +18,20 @@ It started as a fix for the Hi's **key22 "No trigger on y after full movement"**
 - Never retries motion gcode automatically, because a timeout doesn't mean the move didn't run.
 - Every patch is a **dry run by default** and shows you the diff first.
 
+## Screenshots
+
+Onboard a new printer in one place:
+
+![Onboard tab](docs/screenshots/onboard.png)
+
+| Printer | Ramming |
+|---|---|
+| ![Printer tab](docs/screenshots/printer.png) | ![Ramming tab](docs/screenshots/ramming.png) |
+
+| Fixes | CFS |
+|---|---|
+| ![Fixes tab](docs/screenshots/fixes.png) | ![CFS tab](docs/screenshots/cfs.png) |
+
 ## Getting started
 
 1. Install Python 3.8+ (on Windows, tick "Add to PATH").
