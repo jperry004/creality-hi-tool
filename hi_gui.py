@@ -53,7 +53,44 @@ def load_printers():
                     out.append(ln)
     except OSError:
         pass
-    return out or ["hi1=101"]
+    return out
+
+
+def _ip_of(entry):
+    return entry.rpartition("=")[2].split(":")[0].strip()
+
+
+def add_printers_to_file(items):
+    """items = [(name or "", host)]. Appends 'name=host' lines to printers.txt (auto-naming hi1, hi2, ... when the
+    name is blank), skipping hosts already listed. Returns the list of target strings that were added."""
+    path = os.path.join(HERE, "printers.txt")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        text = ""
+    have = load_printers()
+    hosts = {_ip_of(e) for e in have}
+    names = {e.rpartition("=")[0].strip().lower() for e in have if "=" in e}
+    added, lines = [], []
+    n = 1
+    for name, host in items:
+        host = host.strip()
+        if not host or host in hosts:
+            continue
+        name = name.strip().replace(" ", "")
+        if not name:
+            while "hi%d" % n in names:
+                n += 1
+            name = "hi%d" % n
+        names.add(name.lower())
+        hosts.add(host)
+        added.append("%s=%s" % (name, host))
+        lines.append("%s=%s" % (name, host))
+    if lines:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text + ("" if not text or text.endswith("\n") else "\n") + "\n".join(lines) + "\n")
+    return added
 
 
 class QueueWriter:
@@ -85,9 +122,14 @@ class App(tk.Tk):
         top = ttk.Frame(self)
         top.pack(fill="x", **pad)
         ttk.Label(top, text="Printer").pack(side="left")
-        self.printer = ttk.Combobox(top, values=load_printers(), width=24)
-        self.printer.current(0)
+        first = load_printers()
+        self.printer = ttk.Combobox(top, values=first, width=24)
+        if first:
+            self.printer.current(0)
         self.printer.pack(side="left", padx=6)
+        ttk.Button(top, text="Add printers...", command=self.add_printers).pack(side="left", padx=2)
+        if not first:
+            self.after(500, lambda: self.add_printers(auto_scan=True))  # first run: nothing listed yet
         self.verdict = tk.Label(top, text="", font=("Segoe UI", 11, "bold"), padx=10)
         self.verdict.pack(side="right")
 
@@ -374,7 +416,7 @@ class App(tk.Tk):
         pad = dict(padx=6, pady=4)
         f = ttk.Frame(nb)
         nb.add(f, text="  Onboard  ")
-        ttk.Label(f, text="Bring a new / reset Hi up to our setup. Runs the ticked steps in order on the printer picked at the top "
+        ttk.Label(f, text="Bring a new / reset Hi up to the recommended setup. Runs the ticked steps in order on the printer picked at the top "
                           "and stops at the first failure. Printer idle, plate clear. Several steps restart Klipper.",
                   foreground="#555", justify="left", wraplength=900).pack(anchor="w", **pad)
         pw = ttk.Frame(f)
@@ -1460,6 +1502,130 @@ WHEN TO RE-CALIBRATE
 
     def target(self):
         return self.printer.get().strip()
+
+    def add_printers(self, auto_scan=False):
+        """Dialog: scan the LAN for printers (or type an address) and add them to printers.txt."""
+        win = tk.Toplevel(self)
+        win.title("Add printers")
+        win.geometry("640x470")
+        win.transient(self)
+        pad = dict(padx=8, pady=4)
+        ttk.Label(win, text="Scan your network for printers (new ones are pre-selected), then click Add selected. "
+                            "They are saved to printers.txt.", wraplength=610).pack(anchor="w", **pad)
+        top = ttk.Frame(win)
+        top.pack(fill="x", **pad)
+        ttk.Label(top, text="Scan network").pack(side="left")
+        subs = hi_tool.local_subnets()
+        sub = ttk.Combobox(top, values=subs, width=16)
+        sub.set(subs[0] if subs else "192.168.1.")
+        sub.pack(side="left", padx=6)
+        scan_btn = ttk.Button(top, text="Scan")
+        scan_btn.pack(side="left")
+        info = ttk.Label(top, text="", foreground="#555")
+        info.pack(side="left", padx=10)
+
+        cols = ("ip", "kind", "state", "note")
+        tree = ttk.Treeview(win, columns=cols, show="headings", selectmode="extended", height=9)
+        for c, t, w in (("ip", "Address", 130), ("kind", "Type", 150), ("state", "Klipper", 90), ("note", "", 180)):
+            tree.heading(c, text=t)
+            tree.column(c, width=w, anchor="w")
+        tree.pack(fill="both", expand=True, **pad)
+        have = {_ip_of(e) for e in load_printers()}
+        q = queue.Queue()
+
+        def scan():
+            pre = sub.get().strip()
+            prefixes = [p if p.endswith(".") else p + "." for p in pre.replace(",", " ").split()]
+            if not prefixes:
+                return
+            scan_btn.state(["disabled"])
+            tree.delete(*tree.get_children())
+            info.config(text="scanning ...")
+
+            def work():
+                try:
+                    res = hi_tool.discover(prefixes, progress=lambda d, t: q.put(("p", d, t)))
+                    q.put(("done", res))
+                except Exception as e:  # noqa: BLE001
+                    q.put(("err", str(e)))
+            threading.Thread(target=work, daemon=True).start()
+            poll()
+
+        def poll():
+            try:
+                while True:
+                    m = q.get_nowait()
+                    if m[0] == "p":
+                        info.config(text="scanning ... %d%%" % (100 * m[1] // max(m[2], 1)))
+                    elif m[0] == "err":
+                        info.config(text="scan failed: %s" % m[1])
+                        scan_btn.state(["!disabled"])
+                        return
+                    else:
+                        res = m[1]
+                        for r in res:
+                            kind = "Creality printer" if r["creality"] else "Klipper printer"
+                            note = "already in your list" if r["ip"] in have else ""
+                            iid = tree.insert("", "end", values=(r["ip"], kind, r["klippy"], note))
+                            if not note:
+                                tree.selection_add(iid)
+                        info.config(text=("found %d" % len(res)) if res else
+                                    "none found - check the network number, or type the address below")
+                        scan_btn.state(["!disabled"])
+                        return
+            except queue.Empty:
+                pass
+            if win.winfo_exists():
+                win.after(150, poll)
+        scan_btn.config(command=scan)
+
+        def finish(added):
+            if not added:
+                return
+            self.printer["values"] = load_printers()
+            self.printer.set(added[-1])
+            self.status.config(text="added: " + ", ".join(added))
+
+        def add_sel():
+            items = [("", tree.item(i, "values")[0]) for i in tree.selection()
+                     if not tree.item(i, "values")[3]]
+            added = add_printers_to_file(items)
+            if added:
+                for i in tree.selection():
+                    tree.set(i, "note", "added")
+                finish(added)
+                info.config(text="added " + ", ".join(added))
+            else:
+                info.config(text="nothing new selected")
+        ttk.Button(win, text="Add selected", command=add_sel).pack(anchor="e", **pad)
+
+        man = ttk.LabelFrame(win, text="Or type one in")
+        man.pack(fill="x", **pad)
+        ttk.Label(man, text="Address").pack(side="left", padx=4, pady=4)
+        ip_e = ttk.Entry(man, width=18)
+        ip_e.pack(side="left")
+        ttk.Label(man, text="Name (optional)").pack(side="left", padx=(12, 4))
+        nm_e = ttk.Entry(man, width=12)
+        nm_e.pack(side="left")
+
+        def add_manual():
+            host = ip_e.get().strip().replace("http://", "").strip("/")
+            if not host:
+                return
+            if host.isdigit() and subs:
+                host = sub.get().strip().rstrip(".") + "." + host  # just the last number
+            added = add_printers_to_file([(nm_e.get(), host)])
+            if added:
+                finish(added)
+                info.config(text="added " + added[0])
+                ip_e.delete(0, "end")
+                nm_e.delete(0, "end")
+            else:
+                info.config(text="already in the list")
+        ttk.Button(man, text="Add", command=add_manual).pack(side="left", padx=10)
+        ttk.Button(win, text="Close", command=win.destroy).pack(anchor="e", **pad)
+        if auto_scan:
+            win.after(200, scan)
 
     def preset(self, lanes, spacing, speed):
         self.v["lanes"].set(str(lanes))

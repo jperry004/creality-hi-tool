@@ -34,10 +34,14 @@ Onboard a new printer in one place:
 
 ## Getting started
 
-1. Install Python 3.8+ (on Windows, tick "Add to PATH").
-2. Copy `printers.example.txt` to `printers.txt` and list your printers (`hi1=192.168.1.101`, one per line).
-3. Double-click `hi_gui.bat` on Windows, or run `python hi_gui.py`.
+**Windows**
+
+1. Download the repo (green **Code** button, then **Download ZIP**) and unzip it anywhere.
+2. Double-click **`hi_gui.bat`**. If Python isn't installed it offers to install Python 3.12 for you (no admin rights needed), then opens the tool.
+3. First run: the **Add printers** window opens and scans your network. New printers are pre-selected, so click **Add selected**. You can also type an address, or just the last number (`114`), and press **Add**. Printers are saved to `printers.txt`, and you can reopen the window any time with the **Add printers...** button.
 4. For anything over SSH, enable root on the printer's screen and enter the root password in the GUI's **Fixes** tab.
+
+**macOS / Linux:** install Python 3.8+ with Tk, then run `python3 hi_gui.py`.
 
 Ports tried, in order: 4408 (Creality web UI proxy), 7125 (Moonraker), 80.
 

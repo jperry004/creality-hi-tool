@@ -533,6 +533,80 @@ def backup(p, root, label="pull"):
 
 # --------------------------------------------------------------------------- commands
 
+# --------------------------------------------------------------------------- finding printers on the LAN
+
+def local_subnets():
+    """The /24 prefixes of this PC's LAN addresses, e.g. ['192.168.1.']."""
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))  # sends nothing; just makes the OS pick the LAN interface
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    try:
+        for ai in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(ai[4][0])
+    except OSError:
+        pass
+    out = []
+    for ip in sorted(ips):
+        if ip.startswith(("127.", "169.254.")):
+            continue
+        pre = ip.rsplit(".", 1)[0] + "."
+        if pre not in out:
+            out.append(pre)
+    return out
+
+
+def probe_printer(ip, timeout=0.6):
+    """None if ip is not a Klipper/Moonraker printer, else {ip, port, creality, klippy, moonraker}.
+    Port 4408 is Creality's own web-UI proxy, so an open 4408 marks it as a Creality printer."""
+    open_ports = []
+    for port in (4408, 7125, 80):
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                open_ports.append(port)
+        except OSError:
+            continue
+    for port in open_ports:
+        try:
+            req = urllib.request.Request("http://%s:%d/server/info" % (ip, port),
+                                         headers={"User-Agent": "creality-hi-tool/" + VERSION})
+            with _OPENER.open(req, timeout=2.5) as r:
+                res = json.loads(r.read().decode("utf-8", "replace")).get("result")
+            if isinstance(res, dict) and "klippy_state" in res:
+                return {"ip": ip, "port": port, "creality": 4408 in open_ports,
+                        "klippy": res.get("klippy_state", "?"), "moonraker": res.get("moonraker_version", "")}
+        except Exception:
+            continue
+    return None
+
+
+def discover(prefixes=None, progress=None, workers=64):
+    """Scan the given /24 prefixes (default: this PC's own) for Klipper/Moonraker printers. Returns a list of dicts
+    sorted by address. progress(done, total) is called as addresses are checked (from worker threads)."""
+    import concurrent.futures as cf
+    prefixes = prefixes or local_subnets()
+    ips = [pre + str(i) for pre in prefixes for i in range(1, 255)]
+    found, done = [], [0]
+    lock = threading.Lock()
+
+    def one(ip):
+        r = probe_printer(ip)
+        with lock:
+            done[0] += 1
+            if r:
+                found.append(r)
+            if progress:
+                progress(done[0], len(ips))
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(one, ips))
+    found.sort(key=lambda r: tuple(int(x) for x in r["ip"].split(".")))
+    return found
+
+
 def cmd_info(p, a):
     srv = p.connect()
     log("  url:        %s" % p.base)
