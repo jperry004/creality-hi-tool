@@ -20,17 +20,19 @@ It started as a fix for the Hi's **key22 "No trigger on y after full movement"**
 
 ## Screenshots
 
-Onboard a new printer in one place:
+The GUI has one tab per job. A few of them:
 
-![Onboard tab](docs/screenshots/onboard.png)
-
-| Printer | Ramming |
+| Printer: info, backups, errors, G-code console, camera | Ramming: automatic part removal |
 |---|---|
 | ![Printer tab](docs/screenshots/printer.png) | ![Ramming tab](docs/screenshots/ramming.png) |
 
-| Fixes | CFS |
+| Fixes: key22 homing, part fan, update block and more | CFS: status and material database |
 |---|---|
 | ![Fixes tab](docs/screenshots/fixes.png) | ![CFS tab](docs/screenshots/cfs.png) |
+
+| Onboard: run the usual fixes on a new printer in one go |
+|---|
+| ![Onboard tab](docs/screenshots/onboard.png) |
 
 ## Getting started
 
