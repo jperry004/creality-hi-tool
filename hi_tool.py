@@ -89,7 +89,7 @@ Safety rules built in
   * One printer failing never stops the others; a summary is printed at the end.
 
 Examples
-  python hi_tool.py info hi1=106
+  python hi_tool.py info hi1=101
   python hi_tool.py errors 104
   python hi_tool.py homing 104
   python hi_tool.py fix-homing 104   (dry run, shows the diff)
@@ -1689,7 +1689,7 @@ RETRY22_BLOCK = (
 
 
 def patch_homing_py(text):
-    """Apply every missing fix to Creality's homing.py. Returns None if all are already there."""
+    """Apply every missing HI fix to Creality's homing.py. Returns None if all are already there."""
     orig = text
     if DIRSYNC_TAG not in text:
         if text.count(DIRSYNC_ANCHOR) != 1:
@@ -2688,6 +2688,27 @@ def _add_include(text, name):
     return "".join(lines[:idx] + ["[include %s]%s" % (name, eol)] + lines[idx:])
 
 
+def _restore_park(p, parked):
+    """After a RESTART Klipper has forgotten where the toolhead is. Put the pre-restart X/Y/Z back and turn the motors
+    off again: that is the same 'not homed, position still known' state END_PRINT's M84 leaves, so ram --from-park /
+    'parked after END_PRINT' keeps working. Nothing moves (SET_KINEMATIC_POSITION only changes what Klipper believes)."""
+    try:
+        # xyz_ready.z_ready/z_moved reset to 0 on every Klipper restart. With z_ready=0 the next G28 X/Y runs _IF_HOME_Z's
+        # first-home branch (SET_KINEMATIC_POSITION Z=0 + UP_SAFE_Z = physically +15 mm, belief ~10): every Z after that is
+        # ~175 mm too high. Marking Z as already homed makes G28 X Y leave Z alone, as it does when Klipper never restarted.
+        p.gcode("SET_KINEMATIC_POSITION X=%.3f Y=%.3f Z=%.3f\n%s\nM84" % (tuple(parked) + ("SET_GCODE_VARIABLE MACRO=xyz_ready VARIABLE=z_ready VALUE=1\nSET_GCODE_VARIABLE MACRO=xyz_ready VARIABLE=z_moved VALUE=1",)), timeout=20)
+        st = p.state()
+        pos = st.get("position") or [0, 0, 0]
+        if (st.get("homed") or "") == "" and abs(pos[2] - parked[2]) < 0.5:
+            log("  keep-park: restored parked position X%.2f Y%.2f Z%.2f, motors off, not homed (nothing moved)" % tuple(parked))
+            return True
+        log("  keep-park: tried to restore X%.2f Y%.2f Z%.2f but Klipper now says homed='%s' pos=%s - check before ramming; "
+            "Recover Z tab is the fallback" % (parked[0], parked[1], parked[2], st.get("homed"), pos[:3]), "WARN")
+    except ToolError as e:
+        log("  keep-park: could not restore the parked position (%s) - Recover Z tab is the fallback" % e, "WARN")
+    return False
+
+
 def cmd_install_ram(p, a):
     local = a.cfg or default_ram_cfg()
     if not os.path.isfile(local):
@@ -2701,8 +2722,19 @@ def cmd_install_ram(p, a):
         raise ToolError("%s contains FIRMWARE_RESTART - refusing to install it on a Hi" % local)
     remote = a.remote_name
     p.connect()
-    st = p.assert_idle(a.force, keep_position=not getattr(a, "plate_clear", False))
+    keep_park = getattr(a, "keep_park", False)
+    st = p.assert_idle(a.force, keep_position=not (getattr(a, "plate_clear", False) or keep_park))
     log("  state: klippy=%s print=%s" % (st["klippy"], st["print"]))
+    parked = None
+    if keep_park:
+        kp = st.get("position") or [0, 0, 0]
+        if kp[2] >= 5:
+            parked = [float(x) for x in kp[:3]]
+            log("  keep-park: Klipper holds X%.2f Y%.2f Z%.2f (homed='%s'); it will be restored after the RESTART, "
+                "nothing moves" % (parked[0], parked[1], parked[2], st.get("homed") or ""))
+        else:
+            log("  keep-park: Klipper holds no parked position right now (Z%.1f) - nothing to keep, installing normally" % kp[2],
+                "WARN")
     log("  local file: %s (sha %s)" % (local, sha(new_ram)[:12]))
 
     files = {f["path"]: f for f in p.list_config()}
@@ -2771,7 +2803,11 @@ def cmd_install_ram(p, a):
             log("  rollback failed: %s" % e, "ERROR")
         ok2, msg2 = p.restart(check=False)  # rollback: no idle check (we caused this restart)
         log("  after rollback: %s %s" % ("ready" if ok2 else "NOT ready", msg2), "ERROR")
+        if ok2 and parked:
+            _restore_park(p, parked)
         return False
+    if parked:
+        _restore_park(p, parked)
     log("  %s installed and loaded. Backup of the previous config: %s" % (RAM_MACRO, bdir))
     return True
 
@@ -2924,7 +2960,8 @@ def ram_check(p, a, g):
         if a.from_park:
             ok("not homed, parked at Z%.1f (clear of the %.1f mm part): will SET_KINEMATIC_POSITION + G28 X Y, never Z"
                % (pos[2], top))
-            plan["pre"] = "SET_KINEMATIC_POSITION X=%.3f Y=%.3f Z=%.3f\nG28 X Y" % (pos[0], pos[1], pos[2])
+            # z_ready/z_moved=1: stops _IF_HOME_Z re-zeroing Z (and lifting 15 mm) during G28 X Y after a Klipper restart
+            plan["pre"] = ("SET_KINEMATIC_POSITION X=%.3f Y=%.3f Z=%.3f\nSET_GCODE_VARIABLE MACRO=xyz_ready VARIABLE=z_ready VALUE=1\nSET_GCODE_VARIABLE MACRO=xyz_ready VARIABLE=z_moved VALUE=1\nG28 X Y" % (pos[0], pos[1], pos[2]))
         else:
             fail("not homed. It looks parked (Z%.1f) - tick 'parked after END_PRINT' / --from-park. Never G28 Z with parts on the plate."
                  % pos[2])
@@ -4808,6 +4845,50 @@ def cmd_cfs(p, a):
 
 
 
+MATDB = "/mnt/UDISK/creality/userdata/box/material_database.json"
+
+
+def cmd_cfs_material(p, a):
+    """Read only: save the CFS material database and list the entries that mention a material (default PETG)."""
+    rc, out, err = _ssh_run(p, a, "cat %s" % MATDB, timeout=a.ssh_timeout)
+    if rc != 0 or not out:
+        raise ToolError("could not read %s (rc=%s) %s" % (MATDB, rc, err))
+    d = os.path.join(a.backup_dir, p.host)
+    os.makedirs(d, exist_ok=True)
+    fn = os.path.join(d, "material_database_%s.json" % dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    with open(fn, "wb") as fh:
+        fh.write(out)
+    log("  saved %d bytes -> %s" % (len(out), fn))
+    try:
+        data = json.loads(out.decode("utf-8", "replace"))
+    except ValueError as e:
+        log("  not valid JSON (%s); first 600 chars:" % e, "WARN")
+        log(out[:600].decode("utf-8", "replace"))
+        return True
+    log("  top level: %s" % (("keys " + ", ".join(list(data)[:20])) if isinstance(data, dict) else "list of %d" % len(data)))
+    want = a.material.lower()
+    hits = []
+
+    def walk(o, path):
+        if isinstance(o, dict):
+            if any(isinstance(v, str) and want in v.lower() for v in o.values()):
+                hits.append((path, o))
+                return
+            for k, v in o.items():
+                walk(v, path + "/" + str(k))
+        elif isinstance(o, list):
+            for i, v in enumerate(o):
+                walk(v, path + "[%d]" % i)
+    walk(data, "")
+    log("  entries mentioning '%s': %d" % (a.material, len(hits)))
+    for path, o in hits[:12]:
+        log("  %s  %s" % (path, json.dumps(o, ensure_ascii=False)[:700]))
+    if not hits:
+        log("  nothing matched; first 800 chars of the file:")
+        log(out[:800].decode("utf-8", "replace"))
+    return True
+
+
 def _shutdown_board(msg):
     """Which MCU a Klipper error says is shut down: "MCU 'mcu' shutdown: ..." or "Can not update MCU rpi config as it
     is shutdown" (key298). None if no board is named."""
@@ -4897,7 +4978,7 @@ COMMANDS = {
     "fix-homing": cmd_fix, "test-home": cmd_test, "gcode": cmd_gcode, "restore": cmd_restore,
     "fetch-src": cmd_fetch_src, "ssh": cmd_ssh, "diagnose-home": cmd_diagnose, "repro-restart": cmd_repro, "repro-fault": cmd_repro_fault, "restart": cmd_restart, "check-dir": cmd_check_dir, "prove-dir": cmd_prove_dir, "fix-dir": cmd_fix_dir, "fix-sdcard": cmd_fix_sdcard, "restart-service": cmd_restart_service, "fix-fan": cmd_fix_fan, "block-ota": cmd_block_ota, "watch-ota": cmd_watch_ota, "cloud-hosts": cmd_cloud_hosts, "ui-log": cmd_ui_log, "pull-logs": cmd_pull_logs, "fix-grab": cmd_fix_grab, "grab-check": cmd_grab_check,
     "install-ram": cmd_install_ram, "ram": cmd_ram, "ram-check": cmd_ram_check, "recover-z": cmd_recover_z, "jog-z": cmd_jog_z,
-    "webcam": cmd_webcam, "pa": cmd_pa, "pa-fleet": cmd_pa_fleet, "beep": cmd_beep, "install-beeper": cmd_install_beeper, "cfs": cmd_cfs, "recover": cmd_recover,
+    "webcam": cmd_webcam, "pa": cmd_pa, "pa-fleet": cmd_pa_fleet, "beep": cmd_beep, "install-beeper": cmd_install_beeper, "cfs": cmd_cfs, "cfs-material": cmd_cfs_material, "recover": cmd_recover,
 }
 
 
@@ -5015,6 +5096,9 @@ def main(argv=None):
     common(sp)
     sp.add_argument("--cfg", help="local ramming file (default: ramming.cfg next to hi_tool.py)")
     sp.add_argument("--remote-name", default=RAM_REMOTE, help="file name in the printer's config folder")
+    sp.add_argument("--keep-park", action="store_true",
+                    help="parked after END_PRINT: remember Klipper's X/Y/Z, RESTART, then put them back (unhomed, nothing moves) "
+                         "so 'parked after END_PRINT' ramming still works without Recover Z")
     sp.add_argument("--apply", action="store_true")
     sp.add_argument("--motor-wait", type=float, default=15)
 
@@ -5124,6 +5208,11 @@ def main(argv=None):
     common(sp)
     ssh_opts(sp)
 
+    sp = sub.add_parser("cfs-material", help="read only: save the CFS material database from the printer and list the entries for a material")
+    common(sp)
+    ssh_opts(sp)
+    sp.add_argument("--material", default="PETG")
+
     sp = sub.add_parser("beep", help="beep the Hi's buzzer over SSH (--probe: read-only search)")
     sp.add_argument("target")
     common(sp, targets=False)
@@ -5180,7 +5269,7 @@ def main(argv=None):
     sp.add_argument("--axis", default="Y", choices=["X", "Y", "x", "y"])
     sp.add_argument("--target", dest="target_pos", type=float, help="position to park at (default Y260 / X250)")
     sp.add_argument("--by-hand", action="store_true", help="after motors off, you push it to the end by hand")
-    sp.add_argument("--restart-first", action="store_true", help="send RESTART after parking, like the restart-then-home failure")
+    sp.add_argument("--restart-first", action="store_true", help="send RESTART after parking, like this morning's failure")
     sp.add_argument("--motor-wait", type=float, default=15)
     sp.add_argument("--speed", type=int, default=6000)
 

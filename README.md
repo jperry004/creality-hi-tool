@@ -32,9 +32,10 @@ Ports tried, in order: 4408 (Creality web UI proxy), 7125 (Moonraker), 80.
 | Tab | What it does |
 |---|---|
 | **Printer** | Info (Klipper state, versions, homed axes), backup of all config + logs, recent errors grouped by Creality key code, a gcode console, host RESTART, recovery when Klipper is in error, and Klipper `M300`/`BEEP` on the Hi's built-in buzzer |
-| **Ramming** | Automatic part removal with the stock toolhead casing (`REMOVE_PART_DYNAMIC`, see [RAMMING.md](RAMMING.md)): install/update the macro, a readiness check that moves nothing, and running it from a sliced file |
-| **Recover Z** | After a restart with parts still on the plate: home X/Y, move to a clear spot and paper-test Z without `G28 Z`; jog Z without homing |
-| **CFS** | Read-only status and debug info for the CFS box |
+| **Ramming** | Automatic part removal with the stock toolhead casing (`REMOVE_PART_DYNAMIC`, see [RAMMING.md](RAMMING.md)): install/update the macro (optionally keeping a parked toolhead position across the Klipper restart), a readiness check that moves nothing, running it from a sliced file, and a **Last print on this printer** button that downloads the printer's last gcode so you don't have to find it |
+| **Recover Z** | After a restart with parts still on the plate: home X/Y, move to a clear spot and set Z without `G28 Z` (paper test, or a measured gap from a ruler); jog Z without homing |
+| **CFS** | Read-only status and debug info for the CFS box, and a viewer for the box's material database (`cfs-material`) |
+| **Onboard** | One-click bring-up for a new printer: state check, config backup, then the fixes below in order (print-start guard, key22 fix, part fan, cold-grab, update block, ramming macro, camera) with a final check. Runs as a dry run first and stops at the first problem |
 | **Pressure adv.** | Live/saved K, the Creality PA lock and silent mode, line tests, mapping a sliced Orca PA tower to K, logging K changes live during a print, a results notebook, and a guide |
 | **Fixes** | Homing fixes for key22 (see below), the CFS print-start hang fix, a true-100% part fan, blocking firmware update checks, the Fluidd webcam, and pulling all logs |
 

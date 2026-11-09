@@ -30,6 +30,7 @@ import sys
 import threading
 import tkinter as tk
 import time
+import urllib.parse
 import webbrowser
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -71,7 +72,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Creality Hi tool")
-        self.geometry("980x860")
+        self.geometry("980x900")
         self.minsize(800, 620)
         self.q = queue.Queue()
         sys.stdout = sys.stderr = QueueWriter(self.q)  # pythonw has no console; every print lands in Output
@@ -90,23 +91,33 @@ class App(tk.Tk):
         self.verdict = tk.Label(top, text="", font=("Segoe UI", 11, "bold"), padx=10)
         self.verdict.pack(side="right")
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="x", **pad)
+        self.status = ttk.Label(self, text="ready", anchor="w")
+        self.status.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        # tabs on top, Output below, draggable sash between them (the tallest tab used to squeeze Output to a sliver)
+        self.pw = ttk.PanedWindow(self, orient="vertical")
+        self.pw.pack(fill="both", expand=True, **pad)
+        nb = ttk.Notebook(self.pw)
+        self.nb = nb
+        self.pw.add(nb, weight=1)
         self._printer_tab(nb)
         self._ram_tab(nb)
         self._recover_tab(nb)
         self._pa_tab(nb)
         self._cfs_tab(nb)
         self._fixes_tab(nb)
+        self._onboard_tab(nb)
         nb.select(1)
+        nb.bind("<<NotebookTabChanged>>", lambda _e: self.after(60, self._fit_tab))
         hi_tool._ask = self.gui_ask  # interactive steps (diagnose / repro) ask in a dialog instead of the console
 
-        out = ttk.Frame(self)
-        out.pack(fill="both", expand=True, **pad)
+        out = ttk.Frame(self.pw)
+        self.pw.add(out, weight=3)
+        self._out_big = False
         bar = ttk.Frame(out)
         bar.pack(fill="x")
         ttk.Label(bar, text="Output").pack(side="left")
         ttk.Button(bar, text="Clear", command=lambda: self.text.delete("1.0", "end")).pack(side="right")
+        ttk.Button(bar, text="Bigger / smaller output", command=self._toggle_out).pack(side="right", padx=6)
         self.text = tk.Text(out, wrap="none", font=("Consolas", 9), bg="#111", fg="#ddd", insertbackground="#ddd")
         for tag, col in (("ok", "#5fd35f"), ("warn", "#f0c040"), ("fail", "#ff6060"), ("cmd", "#7fb7ff")):
             self.text.tag_configure(tag, foreground=col)
@@ -114,9 +125,37 @@ class App(tk.Tk):
         self.text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.text.pack(fill="both", expand=True)
-        self.status = ttk.Label(self, text="ready", anchor="w")
-        self.status.pack(fill="x", padx=6, pady=(0, 4))
         self.after(100, self.drain)
+        self.after(400, self._fit_tab)
+
+    def _set_sash(self, frac):
+        try:
+            self.update_idletasks()
+            h = self.pw.winfo_height()
+            if h > 100:
+                self.pw.sashpos(0, int(h * frac))
+        except Exception:
+            pass
+
+    def _fit_tab(self):
+        """Size the tabs/Output split to the tab being shown, so its bottom row (e.g. RAM NOW) is never cut off."""
+        try:
+            self.update_idletasks()
+            h = self.pw.winfo_height()
+            if h <= 100:
+                return
+            need = self.nametowidget(self.nb.select()).winfo_reqheight() + 45
+            self.pw.sashpos(0, max(120, min(need, h - 150)))
+            self._out_big = False
+        except Exception:
+            pass
+
+    def _toggle_out(self):
+        self._out_big = not self._out_big
+        if self._out_big:
+            self._set_sash(0.10)
+        else:
+            self._fit_tab()
 
     # ================================================================ tabs
     def _printer_tab(self, nb):
@@ -222,6 +261,10 @@ class App(tk.Tk):
         self._btn(inst, "Browse...", self.pick_cfg).grid(row=0, column=1, **pad)
         self._btn(inst, "Check (dry run)", lambda: self.run_install(False)).grid(row=0, column=2, **pad)
         self._btn(inst, "Install / update", lambda: self.run_install(True)).grid(row=0, column=3, **pad)
+        self.keep_park = tk.BooleanVar(value=False)
+        ttk.Checkbutton(inst, text="Keep parked position through the restart (printer is parked after END_PRINT and nobody has "
+                                   "touched the toolhead) - no Recover Z needed",
+                        variable=self.keep_park).grid(row=1, column=0, columnspan=4, sticky="w", **pad)
         inst.columnconfigure(0, weight=1)
 
         # 2 part
@@ -231,6 +274,7 @@ class App(tk.Tk):
         ttk.Label(part, text="Sliced gcode").grid(row=0, column=0, sticky="w", **pad)
         ttk.Entry(part, textvariable=self.gcode_path).grid(row=0, column=1, columnspan=5, sticky="ew", **pad)
         self._btn(part, "Browse...", self.pick_gcode).grid(row=0, column=6, **pad)
+        self._btn(part, "Last print on this printer", self.last_print).grid(row=0, column=7, **pad)
         self.v = {k: tk.StringVar(value=d) for k, d in (
             ("cx", ""), ("cy", ""), ("top", ""), ("wait", "0"), ("lanes", "1"), ("spacing", "40"),
             ("speed", ""), ("depth", "56"))}
@@ -306,9 +350,101 @@ class App(tk.Tk):
                 ["recover-z", self.target(), "--step", "jog", "--dz", d, "--apply"])).pack(side="left", padx=4, pady=4)
         s4 = ttk.LabelFrame(f, text="4  Done")
         s4.pack(fill="x", **pad)
+        ttk.Label(s4, text="Gap nozzle tip to bed (mm)").pack(side="left", padx=(6, 2))
+        self.rz_gap = tk.StringVar()
+        ttk.Entry(s4, textvariable=self.rz_gap, width=6).pack(side="left")
+        self._btn(s4, "Set Z from my ruler (no paper)", self.rz_set_ruler).pack(side="left", padx=6, pady=4)
         self._btn(s4, "Paper drags - set Z here", self.rz_set).pack(side="left", padx=6, pady=4)
         ttk.Label(s4, text="sets Z=0.1 and lifts to Z40. Then ram with 'parked after END_PRINT' unticked.",
                   foreground="#666").pack(side="left")
+
+    # ================================================================ onboarding tab
+    ONBOARD = (("info", "Info (state check)"),
+               ("pull", "Backup config (pull)"),
+               ("sdcard", "Fix-sdcard - print-start freeze guard"),
+               ("dir", "Fix-dir + retry22 - key22 homing"),
+               ("fan", "Part fan fix (M106 S255 = 100%)"),
+               ("grab", "Cold-grab on the load button"),
+               ("ota", "Block firmware-update hosts"),
+               ("ram", "Install ramming.cfg (REMOVE_PART_DYNAMIC)"),
+               ("cam", "Add camera to Fluidd"),
+               ("final", "Info (final check)"))
+
+    def _onboard_tab(self, nb):
+        pad = dict(padx=6, pady=4)
+        f = ttk.Frame(nb)
+        nb.add(f, text="  Onboard  ")
+        ttk.Label(f, text="Bring a new / reset Hi up to our setup. Runs the ticked steps in order on the printer picked at the top "
+                          "and stops at the first failure. Printer idle, plate clear. Several steps restart Klipper.",
+                  foreground="#555", justify="left", wraplength=900).pack(anchor="w", **pad)
+        pw = ttk.Frame(f)
+        pw.pack(fill="x", **pad)
+        ttk.Label(pw, text="Root password (same box as the Fixes tab)").pack(side="left")
+        ttk.Entry(pw, textvariable=self.ssh_pw, show="*", width=18).pack(side="left", padx=6)
+        box = ttk.LabelFrame(f, text="Steps")
+        box.pack(fill="x", **pad)
+        self.ob = {}
+        for key, label in self.ONBOARD:
+            self.ob[key] = tk.BooleanVar(value=True)
+            ttk.Checkbutton(box, text=label, variable=self.ob[key]).pack(anchor="w", padx=8)
+        b = ttk.Frame(f)
+        b.pack(fill="x", **pad)
+        self._btn(b, "Dry run (changes nothing)", lambda: self.onboard(False)).pack(side="left", padx=4)
+        self._btn(b, "Run selected steps", lambda: self.onboard(True)).pack(side="left", padx=4)
+
+    def onboard(self, apply):
+        if self.busy:
+            return
+        tgt = self.target()
+        if not tgt:
+            messagebox.showwarning("Printer", "Pick a printer first.")
+            return
+        ssh = self._ssh_args()
+        ap = ["--apply"] if apply else []
+        yes = ["--yes"] if apply else []
+        table = {"info": ["info", tgt], "pull": ["pull", tgt],
+                 "sdcard": ["fix-sdcard", tgt] + ap + yes + ssh,
+                 "dir": ["fix-dir", tgt] + ap + yes + ssh,
+                 "fan": ["fix-fan", tgt] + ap,
+                 "grab": ["fix-grab", tgt] + ap + ["--mm", self.gr_mm.get().strip() or "4", "--speed", self.gr_speed.get().strip() or "5"],
+                 "ota": ["block-ota", tgt] + ap + ssh + (["--hosts", self.ota_hosts.get().strip()] if self.ota_hosts.get().strip() else []),
+                 "ram": ["install-ram", tgt, "--cfg", self.cfg_path.get()] + ap,
+                 "cam": ["webcam", "add", tgt] + ap,
+                 "final": ["info", tgt]}
+        steps = [(lbl, table[k]) for k, lbl in self.ONBOARD if self.ob[k].get()]
+        if not steps:
+            return
+        if apply:
+            if any(k in ("sdcard", "dir", "ota") and self.ob[k].get() for k in self.ob) and not ssh:
+                messagebox.showwarning("Onboard", "Type the root password first - the sdcard / dir / update-block steps use SSH.")
+                return
+            if not messagebox.askyesno("Onboard", "Run %d steps on %s?\n\nKlipper restarts several times. The printer must be idle "
+                                       "and the plate clear. Stops at the first failure." % (len(steps), tgt), icon="warning"):
+                return
+        self.set_busy(True)
+
+        def job():
+            try:
+                for i, (lbl, args) in enumerate(steps, 1):
+                    shown = ["***" if j and args[j - 1] == "--ssh-password" else x for j, x in enumerate(args)]
+                    self.q.put("\n=== Onboard %d/%d: %s ===\n$ python hi_tool.py %s\n"
+                               % (i, len(steps), lbl, " ".join(shlex.quote(x) for x in shown)))
+                    try:
+                        rc = hi_tool.main(args)
+                    except SystemExit as e:
+                        rc = e.code
+                    self.q.put("[exit %s]\n" % rc)
+                    if rc not in (0, None):
+                        self.q.put("[ERROR] stopped at step %d (%s). Fix that, untick the finished steps, run again.\n" % (i, lbl))
+                        break
+                else:
+                    self.q.put("\n[OK] Onboard finished%s.\n" % ("" if apply else " (dry run - nothing changed)"))
+            except Exception as e:
+                self.q.put("[ERROR] %s: %s\n" % (type(e).__name__, e))
+            finally:
+                self.q.put(None)
+
+        threading.Thread(target=job, daemon=True).start()
 
     def all_printers(self):
         return [t for t in self.printer.cget("values")] or [self.target()]
@@ -427,6 +563,20 @@ class App(tk.Tk):
             return
         self.run_args(args + ["--apply"])
 
+    def rz_set_ruler(self):
+        try:
+            gap = float(self.rz_gap.get().strip())
+        except ValueError:
+            messagebox.showwarning("Set Z", "Type the measured gap between the nozzle tip and the bed, in mm (e.g. 5).")
+            return
+        if not 0 <= gap <= 60:
+            messagebox.showwarning("Set Z", "Gap should be between 0 and 60 mm here (the nozzle is parked just above the bed).")
+            return
+        if messagebox.askyesno("Set Z", "Tell Klipper the nozzle is %.1f mm above the bed, then lift to Z40?\n\n"
+                               "Err a little LOW if unsure: a too-small number only leaves the casing slightly high; "
+                               "a too-big number can drive it into the bed." % gap):
+            self.run_args(["recover-z", self.target(), "--step", "set", "--paper", "%.3f" % gap, "--apply"])
+
     def rz_set(self):
         if messagebox.askyesno("Set Z", "Paper drags under the nozzle? This sets Z here and lifts to Z40."):
             self.run_args(["recover-z", self.target(), "--step", "set", "--apply"])
@@ -444,6 +594,11 @@ class App(tk.Tk):
         self._btn(r, "Debug (status + slot files + box log, SSH)", lambda: self.run_args(
             ["cfs", "debug", self.target()] + self._ssh_args())).pack(side="left", padx=4)
         ttk.Label(r, text="a full dump is saved in hi_backups/<printer ip>/cfs_*.json", foreground="#666").pack(side="left", padx=8)
+        m = ttk.LabelFrame(f, text="2  Material database (flush temp lives here)")
+        m.pack(fill="x", **pad)
+        self._btn(m, "Show material DB (PETG)", lambda: self.run_args(
+            ["cfs-material", self.target()] + self._ssh_args())).pack(side="left", padx=4, pady=4)
+        ttk.Label(m, text="read only - saves a copy to hi_backups/<printer ip>/material_database_*.json", foreground="#666").pack(side="left", padx=8)
 
     def _pa_tab(self, nb):
         pad = dict(padx=6, pady=3)
@@ -1090,10 +1245,10 @@ WHEN TO RE-CALIBRATE
         "Pre-flight each Hi (lock unlocked, silent mode off) - Status & tweak",
         "All printers: K / lock / silent - note what each Hi runs today (Logs tab)",
         "Check Orca filament profiles: is 'Enable pressure advance' on? which K?",
-        "One printer: Orca PA tower, your PETG at its print temp, coarse 0 / 0.1 / 0.002 - with 'Watch live'",
-        "Same printer: fine tower around the result, step 0.001",
+        "Hi 2: Orca PA tower Extrudr PETG 225C, coarse 0 / 0.1 / 0.002 - with 'Watch live'",
+        "Hi 2: fine tower around the result, step 0.001",
         "Log the result (Logs & results) and type it into the Orca filament profile",
-        "Repeat the fine tower on the other printers (same filament) - compare in the notebook",
+        "Repeat the fine tower on Hi 1 and Hi 3 (same filament) - compare in the notebook",
         "PLA: coarse + fine, log it",
         "Decide the printer.cfg default (Save + RESTART) - the K for your most-used filament",
         "Test print a real part with sharp corners; compare old vs new K",
@@ -1146,7 +1301,7 @@ WHEN TO RE-CALIBRATE
         nb.add(f, text="  Fixes  ")
         top = ttk.Frame(f)
         top.pack(fill="x", **pad)
-        ttk.Label(top, text="Root SSH password (needed for anything over SSH)").pack(side="left")
+        ttk.Label(top, text="Root SSH password (blank = default in hi_tool.py)").pack(side="left")
         self.ssh_pw = tk.StringVar()
         ttk.Entry(top, textvariable=self.ssh_pw, show="*", width=16).pack(side="left", padx=6)
         ttk.Label(top, text="Questions from step-by-step tests pop up as dialogs.", foreground="#666").pack(side="left", padx=10)
@@ -1170,11 +1325,15 @@ WHEN TO RE-CALIBRATE
                  ("Check + home after", lambda: self.fx1(["check-dir", "--home-after"], "Same, then homes straight after the restart. If the pin flipped the bed runs FORWARD into the end. Hand on e-stop.")),
                  ("Prove (both trials)", lambda: self.fx1(["prove-dir"], "Two trials: last Y move backward vs forward, RESTART, home. One is expected to crash on an unpatched Hi. Plate clear, hand on e-stop.")),
                  ("Prove - expect fixed", lambda: self.fx1(["prove-dir", "--expect-fixed"], "After fix-dir: both trials should home normally. Plate clear, hand on e-stop."))])
+        self.fx_force = tk.BooleanVar(value=False)
+        fr = ttk.Frame(rd); fr.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(fr, text="Force the two Restart buttons below (printer says it is printing / stuck) - nozzle and bed are left hot, Z must be re-found with Recover Z",
+                        variable=self.fx_force).pack(side="left")
         row(rd, [("Fix-dir (dry run)", lambda: self.fx(["fix-dir"], ssh=True)),
                  ("Install fix-dir + retry22", lambda: self.fx(["fix-dir", "--apply", "--yes"], "Patch homing.py on the printer over SSH (DIR resync + retry22, adds whichever is missing, backup kept) and restart the Klipper service? Printer must be idle.", ssh=True)),
                  ("Revert fix-dir", lambda: self.fx(["fix-dir", "--revert", "--apply", "--yes"], "Put the original homing.py back (removes DIR resync AND retry22) and restart the Klipper service?", ssh=True)),
-                 ("Restart Klipper service", lambda: self.fx(["restart-service", "--yes"], "Restart the Klipper program on the printer (not the motion board)?", ssh=True)),
-                 ("Restart Klipper + host MCU", lambda: self.fx(["restart-service", "--with-mcu", "--plate-clear"],
+                 ("Restart Klipper service", lambda: self.fx(["restart-service", "--yes"] + (["--force"] if self.fx_force.get() else []), "Restart the Klipper program on the printer (not the motion board)?", ssh=True)),
+                 ("Restart Klipper + host MCU", lambda: self.fx(["restart-service", "--with-mcu", "--plate-clear"] + (["--force"] if self.fx_force.get() else []),
                   "Restart klipper_mcu + Klipper over SSH? Fixes \"MCU 'rpi' ... shutdown\". Host programs only - the motion boards are not reset.", ssh=True))])
         sd = ttk.LabelFrame(f, text="Print-start freeze - a failed CFS reload at print start (e.g. key22) wedges Klipper until power-cycle")
         sd.pack(fill="x", **pad)
@@ -1426,10 +1585,13 @@ WHEN TO RE-CALIBRATE
 
     def run_install(self, apply):
         args = ["install-ram", self.target(), "--cfg", self.cfg_path.get()]
+        if self.keep_park.get():
+            args.append("--keep-park")
         if apply:
             if not messagebox.askyesno("Install", "Upload %s to %s and RESTART Klipper?\n\n"
                                        "A full config backup is taken first and it rolls back if Klipper "
-                                       "doesn't come back ready." % (os.path.basename(self.cfg_path.get()), self.target())):
+                                       "doesn't come back ready.%s" % (os.path.basename(self.cfg_path.get()), self.target(),
+                                       "\n\nThe parked X/Y/Z is put back after the restart (nothing moves)." if self.keep_park.get() else "")):
                 return
             args.append("--apply")
         self.run_args(args)
@@ -1444,6 +1606,9 @@ WHEN TO RE-CALIBRATE
             f = self.extract_3mf(f)
             if not f:
                 return
+        self.load_gcode(f)
+
+    def load_gcode(self, f):
         self.gcode_path.set(f)
         try:
             g = hi_tool.ram_params_from_gcode(f)
@@ -1464,6 +1629,50 @@ WHEN TO RE-CALIBRATE
             msg += "  -  wide plate, lanes set to 3"
         self.foot.configure(text=msg)
         self.verdict.configure(text="")
+
+    def last_print(self):
+        """Ask the selected printer for its most recent print, download that gcode and fill the part fields from it."""
+        tgt = self.target()
+        if not tgt:
+            messagebox.showwarning("Printer", "Pick a printer first.")
+            return
+        self.foot.configure(text="asking %s for its last print..." % tgt)
+
+        def job():
+            try:
+                p = hi_tool.Printer(tgt)
+                p.connect()
+                jobs = [j for j in p.req("GET", "/server/history/list", params={"limit": 5, "order": "desc"}).get("jobs", [])
+                        if j.get("filename")]
+                if not jobs:
+                    raise hi_tool.ToolError("%s has no print history" % tgt)
+                j = jobs[0]
+                name = j["filename"]
+                data = p.req("GET", "/server/files/gcodes/" + urllib.parse.quote(name), raw=True, timeout=180, retries=1)
+                outdir = os.path.join(HERE, "gcode", "_from_printer")
+                os.makedirs(outdir, exist_ok=True)
+                tag = "".join(c if c.isalnum() or c in "-_" else "_" for c in (p.name or "printer"))
+                path = os.path.join(outdir, "%s_%s" % (tag, os.path.basename(name)))
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                self.after(0, lambda: self.last_print_done(path, j))
+            except Exception as e:
+                self.after(0, lambda: (self.foot.configure(text="last print failed"), messagebox.showerror("Last print", str(e))))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def last_print_done(self, path, j):
+        self.load_gcode(path)
+        end = j.get("end_time") or 0
+        age = (time.time() - end) if end else None
+        note = "last print: %s (%s)" % (j.get("filename"), j.get("status", "?"))
+        if age is not None and age > 0:
+            h, m = int(age // 3600), int(age % 3600 // 60)
+            note += ", ended %dh %dm ago" % (h, m)
+            if age >= 3600:
+                self.v["wait"].set("0")
+                note += " - Wait set to 0 (cooled)"
+        self.foot.configure(text=note + "   |   " + self.foot.cget("text"))
 
     def extract_3mf(self, path, warn=True):
         """Pull one plate's gcode out of a .gcode.3mf next to it; returns the .gcode path or None."""
